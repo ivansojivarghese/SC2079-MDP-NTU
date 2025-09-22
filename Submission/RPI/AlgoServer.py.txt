@@ -1,0 +1,62 @@
+import socket
+import pickle
+import json
+import time
+
+class RPiServer:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow immediate reuse of address
+        self.__data = []
+        self.conn = None
+        self.address = None
+
+    def start(self):
+        print(f"Starting server at {self.host}:{self.port}")
+        self.socket.bind((self.host, self.port))
+        self.socket.listen()
+        print("Listening for connections...")
+
+        while True:
+            try:
+                self.conn, self.address = self.socket.accept()
+                print(f"Connection established with {self.address}")
+            except Exception as e:
+                print(f"Error accepting connection: {e}")
+                time.sleep(2)  # Delay before retrying
+
+    def receive_data(self):
+        if self.conn is None:
+            raise ValueError("No active connection.")
+
+        try:
+            d = self.conn.recv(1024)
+            if not d:
+                return None  # Client disconnected
+
+            decoded_data = json.loads(d.decode('utf-8'))
+            print("Received data:", decoded_data)
+            return decoded_data
+        except (json.JSONDecodeError, ConnectionResetError) as e:
+            print(f"Receive error: {e}")
+            return None
+
+    def send_data(self, data):
+        if not self.conn:
+            print("No active connection.")
+            return
+        
+        try:
+            serialized_data = pickle.dumps(data)
+            self.conn.sendall(serialized_data)
+            print(f"Sent data: {data}")
+        except Exception as e:
+            print(f"Send error: {e}")
+
+    def close(self):
+        print("Closing socket.")
+        if self.conn:
+            self.conn.close()
+        self.socket.close()

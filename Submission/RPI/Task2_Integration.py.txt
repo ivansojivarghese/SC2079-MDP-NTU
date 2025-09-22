@@ -1,0 +1,394 @@
+import bluetooth
+import serial
+import threading
+import signal
+import sys
+import time
+import json
+import re
+import socket
+import os
+import queue
+import datetime
+
+# UART Configuration
+UART_PORT = "/dev/ttyUSB0"
+BAUD_RATE = 115200
+IS_INDOOR = True
+
+# Detection Server Configuration
+DETECTION_SERVER_HOST = "localhost"
+DETECTION_SERVER_PORT = 5050
+
+# Network variables
+client_sock = None
+server_sock = None
+ser = None
+detection_sock = None
+detection_sock_lock = threading.Lock() 
+
+# Global Variables
+UART_MESSAGE = None
+BLUETOOTH_MESSAGE = None
+SEND_STM_MESSAGE = ""
+STM_ACKNOWLEDGE = False
+
+# Task 2
+ackCounter = 0
+lastDir = ""
+START_T2 = False
+START_MSG = "DT027"
+
+detection_result_queue = queue.Queue()
+is_detection_request_in_progress = False
+
+#Close all sockets properly
+def cleanup():
+    global client_sock, server_sock, ser, detection_sock
+    if client_sock:
+        client_sock.close()
+        print("Bluetooth socket closed.")
+    if server_sock:
+        server_sock.close()
+        print("Bluetooth server socket closed.")
+    if ser and ser.is_open:
+        ser.close()
+        print("UART connection closed.")
+    if detection_sock:
+        with detection_sock_lock:
+            detection_sock.close()
+        print("Detection socket closed.")
+
+#"Ctrl C Handler for RPI terminal"
+def signal_handler(sig, frame):
+    print("Signal received, shutting down...")
+    cleanup()
+    sys.exit(0)
+
+#Starts the bluetooth server. Threads bluetooth + uart upon getting a bluetooth connection.
+def start_bluetooth_server():
+    global client_sock, server_sock
+    server_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+    server_sock.bind(("", 1))
+    server_sock.listen(1)
+    print("Waiting for a Bluetooth connection...")
+
+    client_sock, client_info = server_sock.accept()
+    print(f"Accepted connection from {client_info}")
+
+    # Start threads for real-time communication
+    threading.Thread(target=handle_bluetooth_messages, daemon=True).start()
+    threading.Thread(target=handle_uart_messages, daemon=True).start()
+
+    while True:
+        try:
+            signal.pause()
+        except AttributeError:
+            while True:
+                time.sleep(1)
+
+#Handle messages received from android. If start message, reset all variables
+def handle_bluetooth_messages():
+    global client_sock, SEND_STM_MESSAGE, STM_ACKNOWLEDGE, START_T2, ackCounter
+    while True:
+        try:
+            data = client_sock.recv(1024)
+            if not data:
+                break
+            message = data.decode().strip()
+
+            print(f"Received From BT: {message}")
+            parts = message.split('#')
+            if len(parts) > 1 and parts[1] == "Begin Task 2":
+                START_T2 = True
+                STM_ACKNOWLEDGE = True
+                ackCounter = 0
+                #SEND_STM_MESSAGE = ""
+                print("Starting T2")
+            else:
+                print("Unknown message format or missing '#' in message")
+
+        except bluetooth.btcommon.BluetoothError as e:
+            print(f"Bluetooth error: {e}")
+            break
+
+#Connect to image rec server
+def connect_to_detection_server():
+    global detection_sock
+    with detection_sock_lock:
+        for attempt in range(5):
+            try:
+                print(f"Connecting to detection server at {DETECTION_SERVER_HOST}:{DETECTION_SERVER_PORT} (Attempt {attempt+1}/5)")
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+                # -- Enable TCP Keepalive Options --
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                sock.settimeout(10)
+
+                sock.connect((DETECTION_SERVER_HOST, DETECTION_SERVER_PORT))
+                print("Connected to detection server")
+                detection_sock = sock
+                return True
+            except (socket.error, ConnectionRefusedError) as e:
+                print(f"Failed to connect: {e} (Attempt {attempt+1}/5)")
+                sock.close()
+                if attempt < 4:
+                    print("Retrying in 2 seconds...")
+                    time.sleep(2)
+                else:
+                    print("Max retries reached. Will attempt to reconnect later.")
+                    detection_sock = None
+                    return False
+
+#Threads image detection to avoid blocking. - threads requesting image rec
+def threaded_detection(obstacle_id):
+    detection_thread = threading.Thread(target=request_image_detection, args=(obstacle_id,))
+    detection_thread.daemon = True
+    detection_thread.start()
+    return detection_thread
+
+#Requests image rec
+def request_image_detection(obstacle_id):
+    global detection_sock
+    with detection_sock_lock:
+        if not detection_sock:
+            print("No connection to detection server. Attempting to reconnect...")
+            if not connect_to_detection_server():
+                print("Reconnection failed. Cannot perform detection.")
+                return
+
+        try:
+            command = f"P__{obstacle_id}"
+            detection_sock.sendall(command.encode('utf-8'))
+            print(f"Sent detection command: {command}")
+        except (socket.timeout, socket.error, ConnectionResetError, BrokenPipeError) as e:
+            print(f"Socket error while sending detection request: {e}")
+            # Attempt reconnect
+            detection_sock.close()
+            detection_sock = None
+            if connect_to_detection_server():
+                request_image_detection(obstacle_id)
+
+#Handle UART messages. ACK = send next message. ACK 0 = Start. ACK 1 = TA, ACK 2 = PP, ACK 3 = DZ, ACK 4 = TB, ACK 5 = GH
+def handle_uart_messages():
+    global ser, STM_ACKNOWLEDGE, SEND_STM_MESSAGE, lastDir, START_T2, ackCounter, IS_INDOOR
+    try:
+        ser = serial.Serial(UART_PORT, BAUD_RATE, timeout=0.1)
+        send_bluetooth_message("Robot Ready")
+
+        while True:
+            response = ser.readline().decode().strip()
+            if response:
+                print(f"Received from UART: {response}")
+                if response == "ACK":
+                    STM_ACKNOWLEDGE = True
+                    ackCounter += 1
+
+            # If we started T2
+            if STM_ACKNOWLEDGE and START_T2:
+                STM_ACKNOWLEDGE = False
+                START_T2 = False
+                send_uart_message("DZ027")  # Example
+
+            # If we've had 3 acks
+            if ackCounter == 3 and STM_ACKNOWLEDGE:
+                send_uart_message("DZ027")
+                STM_ACKNOWLEDGE = False
+
+            elif STM_ACKNOWLEDGE:
+                STM_ACKNOWLEDGE = False
+                if IS_INDOOR:
+                    # Indoor logic
+                    if ackCounter == 1 and SEND_STM_MESSAGE:
+                        if SEND_STM_MESSAGE == "Left":
+                            leftMSG = "TA004"
+                            send_uart_message(leftMSG)
+                            lastDir = leftMSG
+                        else:
+                            rightMSG = "TA003"
+                            send_uart_message(rightMSG)
+                            lastDir = rightMSG
+                        SEND_STM_MESSAGE = ""
+                    elif ackCounter == 2:
+                        if lastDir == "TA003":
+                            send_uart_message("PP003")
+                        else:
+                            send_uart_message("PP004")
+                        SEND_STM_MESSAGE = ""
+                    elif ackCounter == 4 and SEND_STM_MESSAGE:
+                        if SEND_STM_MESSAGE == "Left":
+                            leftMSG = "TB004"
+                            send_uart_message(leftMSG)
+                            lastDir = leftMSG
+                        else:
+                            rightMSG = "TB003"
+                            send_uart_message(rightMSG)
+                            lastDir = rightMSG
+                        SEND_STM_MESSAGE = ""
+                        request_stitch_images()
+                    elif ackCounter == 5:
+                        if lastDir == "TB003":
+                            send_uart_message("GH003")
+                        else:
+                            send_uart_message("GH004")
+                        request_stitch_images()
+                        SEND_STM_MESSAGE = ""
+                    else:
+                        STM_ACKNOWLEDGE = True
+                else:
+                    # Outdoor logic
+                    if ackCounter == 1 and SEND_STM_MESSAGE:
+                        if SEND_STM_MESSAGE == "Left":
+                            leftMSG = "TA002"
+                            send_uart_message(leftMSG)
+                            lastDir = leftMSG
+                        else:
+                            rightMSG = "TA001"
+                            send_uart_message(rightMSG)
+                            lastDir = rightMSG
+                        SEND_STM_MESSAGE = ""
+                    elif ackCounter == 2:
+                        if lastDir == "TA002":
+                            send_uart_message("PP002")
+                        else:
+                            send_uart_message("PP001")
+                        SEND_STM_MESSAGE = ""
+                    elif ackCounter == 4 and SEND_STM_MESSAGE:
+                        if SEND_STM_MESSAGE == "Left":
+                            leftMSG = "TB002"
+                            send_uart_message(leftMSG)
+                            lastDir = leftMSG
+                        else:
+                            rightMSG = "TB001"
+                            send_uart_message(rightMSG)
+                            lastDir = rightMSG
+                        SEND_STM_MESSAGE = ""
+                        request_stitch_images()
+                    elif ackCounter == 5:
+                        if lastDir == "TB002":
+                            send_uart_message("GH002")
+                        else:
+                            send_uart_message("GH001")
+                        request_stitch_images()
+                        SEND_STM_MESSAGE = ""
+                    else:
+                        STM_ACKNOWLEDGE = True
+                        
+    except Exception as e:
+        print(f"UART error: {e}")
+
+#Sends UART messages
+def send_uart_message(message):
+    global ser, STM_ACKNOWLEDGE
+    try:
+        if not ser or not ser.is_open:
+            ser = serial.Serial(UART_PORT, BAUD_RATE, timeout=0.1)
+        ser.write(message.encode())
+        ser.flush()
+        print(f"Sent to UART: {message}")
+        STM_ACKNOWLEDGE = False
+    except Exception as e:
+        print(f"UART send error: {e}")
+
+#Sends BT messages
+def send_bluetooth_message(message):
+    global client_sock
+    if client_sock:
+        try:
+            client_sock.send(message.encode())
+            print(f"Sent to Bluetooth: {message}")
+        except bluetooth.btcommon.BluetoothError as e:
+            print(f"Bluetooth send error: {e}")
+
+#Get results from image rec.
+def listen_for_detection_results():
+    global detection_sock, SEND_STM_MESSAGE, is_detection_request_in_progress
+    print("Started detection result listener")
+    last_result_time = 0
+
+    while True:
+        # Ensure we have a connected socket
+        with detection_sock_lock:
+            if not detection_sock:
+                print("Attempting to reconnect to detection server in listener...")
+                if not connect_to_detection_server():
+                    time.sleep(2)
+                    continue
+            detection_sock.settimeout(3)
+
+            try:
+                data = detection_sock.recv(1024)
+            except socket.timeout:
+                data = None
+            except (socket.error, ConnectionResetError, BrokenPipeError) as e:
+                print(f"Error listening for results: {e}")
+                detection_sock.close()
+                detection_sock = None
+                is_detection_request_in_progress = False
+                time.sleep(2)
+                continue
+
+        # Outside the lock, to not block other requests:
+        if data:
+            result_str = data.decode('utf-8')
+            if not result_str:
+                print("Detection server closed connection (recv returned empty).")
+                with detection_sock_lock:
+                    detection_sock.close()
+                    detection_sock = None
+                continue
+
+            print(f"*** DETECTION RESULT RECEIVED: {result_str} ***")
+            try:
+                result = json.loads(result_str)
+            except json.JSONDecodeError:
+                print("Invalid JSON from detection server.")
+                continue
+
+            is_detection_request_in_progress = False
+
+            class_id = result.get('class_id', '0')
+            if class_id == "39":
+                SEND_STM_MESSAGE = "Left"
+                print("LEFT detected")
+            elif class_id == "38":
+                SEND_STM_MESSAGE = "Right"
+                print("RIGHT detected")
+
+            last_result_time = time.time()
+        else:
+            # data is None or we got a timeout
+            # If no detection for >5s, request again
+            if time.time() - last_result_time > 5 and not is_detection_request_in_progress:
+                print("No detection received. Requesting new image processing...")
+                is_detection_request_in_progress = True
+                threaded_detection(0)  # Kick off a new detection request
+
+def request_stitch_images():
+    global detection_sock
+    with detection_sock_lock:
+        if not detection_sock:
+            print("Cannot stitch because detection_sock is not connected.")
+            return
+        try:
+            detection_sock.sendall(b"STITCH")
+            print("Sent STITCH command to inference server.")
+        except Exception as e:
+            print(f"Error sending STITCH command: {e}")
+            detection_sock.close()
+            detection_sock = None
+
+#Starts processes. 
+def main():
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # Connect once
+    threading.Thread(target=connect_to_detection_server, daemon=True).start()
+    # Start listening thread
+    threading.Thread(target=listen_for_detection_results, daemon=True).start()
+
+    # Start Bluetooth server
+    start_bluetooth_server()
+
+if __name__ == "__main__":
+    main()

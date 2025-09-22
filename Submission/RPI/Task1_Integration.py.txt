@@ -1,0 +1,371 @@
+import bluetooth
+import serial
+import threading
+import signal
+import sys
+import time
+import json
+import re
+import socket
+import os
+import queue
+from AlgoServer import RPiServer  
+
+# UART Configuration
+UART_PORT = "/dev/ttyUSB0"
+BAUD_RATE = 115200  
+
+# Detection Server Configuration
+DETECTION_SERVER_HOST = "localhost"
+DETECTION_SERVER_PORT = 5050
+
+# Network variables
+client_sock = None
+server_sock = None
+ser = None
+detection_sock = None
+AlgoServer = None
+
+# Global Variables
+BLUETOOTH_MESSAGE = None
+SEND_STM_MESSAGE = []
+STM_ACKNOWLEDGE = True
+
+detection_result_queue = queue.Queue()
+
+#Close all sockets properly
+def cleanup(): 
+    global client_sock, server_sock, ser, detection_sock
+    if client_sock:
+        client_sock.close()
+        print("Bluetooth socket closed.")
+    if server_sock:
+        server_sock.close()
+        print("Bluetooth server socket closed.")
+    if ser and ser.is_open:
+        ser.close()
+        print("UART connection closed.")
+    if detection_sock:
+        detection_sock.close()
+        print("Detection socket closed.")
+
+#"Ctrl C Handler for RPI terminal"
+def signal_handler(sig, frame):
+    print("Signal received, shutting down...")
+    cleanup()
+    sys.exit(0)
+
+#Connects to algo server.
+def algoConnection():
+    global AlgoServer
+    AlgoServer = RPiServer("", 4060)
+    
+    # Ensure server starts and waits for a client
+    threading.Thread(target=AlgoServer.start, daemon=True).start()
+
+    # Keep receiving commands in a loop
+    receive_commands(AlgoServer)
+
+#Starts the bluetooth server. Threads bluetooth + uart upon getting a bluetooth connection.
+def start_bluetooth_server():
+    global client_sock, server_sock
+    server_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+    server_sock.bind(("", 1))
+    server_sock.listen(1)
+    print("Waiting for a Bluetooth connection...")
+
+    client_sock, client_info = server_sock.accept()
+    print(f"Accepted connection from {client_info}")
+
+    # Start threads for real-time communication
+    threading.Thread(target=handle_bluetooth_messages, daemon=True).start()
+    threading.Thread(target=handle_uart_messages, daemon=True).start()
+
+    while True:
+        try:
+            signal.pause()  # Wait for signal to terminate
+        except AttributeError:
+            while True:
+                time.sleep(1)  # Alternative for Windows (no pause())
+
+#Handle messages received from android. Seperate by tagging. STM goes to STM. Algo goes to Algo.
+def handle_bluetooth_messages():
+    global client_sock, AlgoServer, SEND_STM_MESSAGE
+    while True:
+        try:
+            data = client_sock.recv(1024)
+            if not data:
+                break
+            message = data.decode().strip()
+            
+            print(f"Received From BT: {message}")
+            parts = message.split('#')
+            
+            if message.upper() == "RESET":
+                SEND_STM_MESSAGE = []
+                STM_ACKNOWLEDGE = True
+                BLUETOOTH_MESSAGE = None
+                print(f"Reset all values")
+            elif parts[0] == "STM":
+                SEND_STM_MESSAGE.append(parts[1])
+                print("Sending to STM")
+            elif parts[0] == "ALGO":
+                AlgoServer.send_data(parts[1])
+                print("Sending to Algo")
+            else:
+                print("Unknown message format")
+        except bluetooth.btcommon.BluetoothError as e:
+            print(f"Bluetooth error: {e}")
+            break
+
+#Connect to image rec server
+def connect_to_detection_server():
+    global detection_sock
+    max_attempts = 5
+    attempt = 0
+    
+    while attempt < max_attempts:
+        try:
+            print(f"Connecting to detection server at {DETECTION_SERVER_HOST}:{DETECTION_SERVER_PORT}")
+            detection_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            detection_sock.settimeout(5)  # 5 second timeout
+            detection_sock.connect((DETECTION_SERVER_HOST, DETECTION_SERVER_PORT))
+            print("Connected to detection server")
+            return True
+        except Exception as e:
+            attempt += 1
+            print(f"Failed to connect to detection server (attempt {attempt}/{max_attempts}): {e}")
+            if detection_sock:
+                detection_sock.close()
+                detection_sock = None
+            time.sleep(2)
+    
+    print("Could not connect to detection server after multiple attempts")
+    return False
+
+#Threads image detection to avoid blocking. - threads requesting image rec
+def threaded_detection(obstacle_id):
+    detection_thread = threading.Thread(target=request_image_detection, args=(obstacle_id,))
+    detection_thread.daemon = True
+    detection_thread.start()
+    return detection_thread
+
+#Requests image rec
+def request_image_detection(obstacle_id):
+    global detection_sock
+    
+    if not detection_sock:
+        if not connect_to_detection_server():
+            print("Cannot perform detection - no connection to detection server")
+            detection_result_queue.put((obstacle_id, None))
+            return
+    try:
+        start_time = time.time()
+        
+        command = f"P__{obstacle_id}"
+        detection_sock.sendall(command.encode('utf-8'))
+        
+        detection_sock.settimeout(30.0)
+        data = detection_sock.recv(1024)
+        
+        if not data:
+            print("No response from detection server")
+            detection_sock.close()
+            detection_sock = None
+            detection_result_queue.put(None)
+            return
+        
+        result = json.loads(data.decode('utf-8'))
+        elapsed = time.time() - start_time
+        print(f"Detection result received in {elapsed:.3f} seconds: {result}")
+        
+        detection_result_queue.put((obstacle_id, result))
+
+    except socket.timeout:
+        print("Detection request timed out")
+        if detection_sock:
+            detection_sock.close()
+            detection_sock = None
+        detection_result_queue.put((obstacle_id, None))
+
+    except Exception as e:
+        print(f"Detection request error: {e}")
+        if detection_sock:
+            detection_sock.close()
+            detection_sock = None
+        detection_result_queue.put((obstacle_id, None))
+
+def start_detection_callback_server():
+    callback_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    callback_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    try:
+        callback_socket.bind(("localhost", 5051))
+        callback_socket.listen(5)
+        print("Detection callback server started on port 5051")
+        
+        while True:
+            client, addr = callback_socket.accept()
+            data = client.recv(4096)
+            if data:
+                try:
+                    result = json.loads(data.decode())
+                    obstacle_id = result["obstacle_id"]
+                    class_id = result["class_id"]
+                    
+                    print(f">>> CALLBACK: Detection result for obstacle {obstacle_id}: class_id={class_id}")
+                    
+                    # Send directly to Android
+                    send_bluetooth_message(f"TARGET,{obstacle_id},{class_id}")
+                    print(f">>> SENT TO ANDROID: TARGET,{obstacle_id},{class_id}")
+                    
+                except Exception as e:
+                    print(f"Error processing detection callback: {e}")
+            client.close()
+    except Exception as e:
+        print(f"Callback server error: {e}")
+    finally:
+        callback_socket.close()
+
+#If STM gives ACK, proceed to send next message to the STM. set timeout = 0.1 to avoid burning the STM - too fast = too fast
+# P___X = obstacle id to scan. Upon receiving scan command, dont send to stm. instead tell RPI to scan image. pop to remove from Q
+def handle_uart_messages():
+    """Continuously read UART messages and send them to Bluetooth in real-time."""
+    global ser, STM_ACKNOWLEDGE, SEND_STM_MESSAGE
+    try:
+        ser = serial.Serial(UART_PORT, BAUD_RATE, timeout=0.1)
+        send_bluetooth_message("Robot Ready")
+        while True:
+            response = ser.readline().decode().strip()
+            #print(f"within")
+            if response:
+                print(f"Received from UART: {response}")
+                if response == "ACK":
+                    STM_ACKNOWLEDGE = True
+                
+            
+            if STM_ACKNOWLEDGE and SEND_STM_MESSAGE:
+                command = SEND_STM_MESSAGE[0]
+                print(f"In attempt to tsend")
+                # Check for patterns that might indicate image recognition command
+                pattern1 = re.compile(r'^P__(\d{1,2})$')  # P__X or P__XX
+                pattern2 = re.compile(r'^P___(\d{1})$')   # P___X (three underscores)
+                
+                match1 = pattern1.match(command)
+                match2 = pattern2.match(command)
+                turns = ["BL","BR","FL","FR"]
+    
+                if not (match1 or match2) and SEND_STM_MESSAGE:
+                    SEND_STM =  SEND_STM_MESSAGE.pop(0)
+                    time.sleep(0.25)
+                    
+                    send_uart_message(SEND_STM)
+                    send_bluetooth_message("STATUS#" + SEND_STM)
+                    
+                if match1 or match2:
+                    print(f"In Match")
+                    # Extract obstacle ID from whichever pattern matched
+                    obstacle_id = match1.group(1) if match1 else match2.group(1)
+                    print(f"Starting threaded detection for obstacle {obstacle_id}...")
+                    SEND_STM_MESSAGE.pop(0)
+            
+                    # Format obstacle ID consistently for the detection server
+                    # Pad with zero if it's a single digit
+                    padded_obstacle_id = obstacle_id.zfill(2)
+                    threaded_detection(padded_obstacle_id)
+                    
+                    # Request detection from the detection server with properly formatted ID
+                    # This will now take as long as needed or until maximum retries
+                    print(f"Starting detection for obstacle {obstacle_id}, this may take some time...")
+                    time.sleep(0.5)
+                    
+            try:
+                # Get both the obstacle_id and result from queue
+                obstacle_id, detection_result = detection_result_queue.get_nowait()
+                if detection_result:
+                    class_id = detection_result.get('class_id', 0)
+                    send_bluetooth_message(f"TARGET,{obstacle_id},{class_id}")
+                    print(f"Sent detection result to Android: TARGET,{obstacle_id},{class_id}")
+                else:
+                    send_bluetooth_message(f"TARGET,{obstacle_id},0")
+                    print(f"Sent null detection to Android: TARGET,{obstacle_id},0")
+            except queue.Empty:
+                pass                                      
+    except Exception as e:
+        print(f"UART error: {e}")
+    
+#Sends UART messages
+def send_uart_message(message):
+    global ser, STM_ACKNOWLEDGE
+    try:
+        if not ser or not ser.is_open:
+            ser = serial.Serial(UART_PORT, BAUD_RATE, timeout=1)
+        if STM_ACKNOWLEDGE:
+            ser.write(message.encode())
+            ser.flush()
+            print(f"Sent to UART: {message}\n")
+            STM_ACKNOWLEDGE = False
+    except Exception as e:
+        print(f"UART send error: {e}\n")
+
+#Sends BT messages
+def send_bluetooth_message(message):
+    global client_sock
+    if client_sock:
+        try:
+            client_sock.send(message.encode())
+            print(f"Sent to Bluetooth: {message}")
+        except bluetooth.btcommon.BluetoothError as e:
+            print(f"Bluetooth send error: {e}")
+
+#Receives information from the algo server.
+def receive_commands(server):
+    global SEND_STM_MESSAGE, STM_ACKNOWLEDGE
+    
+    print("Receiving Commands...")
+    while True:
+        try:
+            commands = server.receive_data()
+            
+            if commands:
+                print("Commands received:", commands)
+                print(type(commands))
+                
+                SEND_STM_MESSAGE = commands
+                STM_ACKNOWLEDGE = True
+
+                print("Updated STM Message Queue:", SEND_STM_MESSAGE)
+            
+            elif commands is None:
+                #print("Client disconnected. Waiting for reconnection...")
+                while server.conn is None:
+                    time.sleep(1)
+
+        except Exception as e:
+            #print(f"Error in receive_commands: {e}")
+            time.sleep(2)
+
+def main():
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # Start all threads as daemon
+    callback_thread = threading.Thread(target=start_detection_callback_server, daemon=True)
+    algo_thread = threading.Thread(target=algoConnection, daemon=True)
+    bluetooth_thread = threading.Thread(target=start_bluetooth_server, daemon=True)
+    detection_thread = threading.Thread(target=connect_to_detection_server, daemon=True)
+
+    callback_thread.start()
+    algo_thread.start()
+    bluetooth_thread.start()
+    detection_thread.start()
+
+    # Keep main thread alive without blocking
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Main thread received interrupt")
+        cleanup()
+
+if __name__ == "__main__":
+    main()

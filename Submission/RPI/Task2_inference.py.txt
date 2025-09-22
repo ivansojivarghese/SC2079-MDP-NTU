@@ -1,0 +1,345 @@
+import cv2
+import time
+import os
+import threading
+import subprocess
+import socket
+import json
+from ultralytics import YOLO
+import numpy as np
+import re
+from PIL import Image
+
+# =============================================
+# Configuration Section
+# =============================================
+MODEL_PATH = "/home/MDP35/Desktop/Image-Rec/best_task2.pt"
+SAVE_DIR = "/home/MDP35/Desktop/Image-Rec/Results"
+STITCH_DIR = "/home/MDP35/Desktop/Image-Rec/Results/Stitch"
+RESOLUTION = (1000, 1000)
+CONFIDENCE = 0.4
+DETECTION_INTERVAL = 0.25
+SERVER_PORT = 5050
+
+# Only left and right in the code, ignoring bullseye
+CLASS_MAPPING = {
+    'left': 39,
+    'right': 38,
+}
+
+class DetectionServer:
+    def __init__(self, host="0.0.0.0", port=SERVER_PORT):
+        self.host = host
+        self.port = port
+        self.server_socket = None
+        self.client_socket = None
+        self.running = False
+        self.model = None
+        self.temp_dir = os.path.join(SAVE_DIR, 'temp')
+        
+        # Create directories
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        os.makedirs(self.temp_dir, exist_ok=True)
+        os.makedirs(STITCH_DIR, exist_ok=True)
+
+        print("Preloading YOLO model...")
+        self.model = YOLO(MODEL_PATH)
+        print("Model loaded successfully.")
+
+        print("Warming up model with dummy inference...")
+        dummy_img = np.zeros((RESOLUTION[1], RESOLUTION[0], 3), dtype=np.uint8)
+        self.model(dummy_img)
+        print("Model warmup complete")
+
+    def _cleanup_camera(self):
+        """Optionally reset camera hardware if needed. If stable, you can skip this."""
+        try:
+            subprocess.run(['sudo', 'pkill', '-f', 'libcamera'], check=False)
+            subprocess.run(['sudo', 'pkill', '-f', 'camera'], check=False)
+            subprocess.run(['sudo', 'modprobe', '-r', 'bcm2835-v4l2'], check=False)
+            time.sleep(1)
+            subprocess.run(['sudo', 'modprobe', 'bcm2835-v4l2'], check=False)
+            time.sleep(2)
+        except Exception as e:
+            print(f"Warning: Camera cleanup error: {str(e)}")
+
+    def setup_server(self):
+        """Set up a server socket, enabling keepalive for half-open detection."""
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            # Keepalive
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(1)
+            print(f"Detection server listening on {self.host}:{self.port}")
+            return True
+        except Exception as e:
+            print(f"Failed to set up server socket: {str(e)}")
+            return False
+
+    def accept_connection(self):
+        print("Waiting for connection from integration.py...")
+        try:
+            self.client_socket, client_addr = self.server_socket.accept()
+            print(f"Connected to integration.py at {client_addr}")
+
+            # Keepalive on the accepted socket
+            self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            return True
+        except Exception as e:
+            print(f"Failed to accept connection: {str(e)}")
+            return False
+
+    def stitch_first_and_latest(self):
+        """
+        Finds earliest and latest 'detected_*.jpg' in SAVE_DIR,
+        stitches them side-by-side, saves to STITCH_DIR.
+        """
+        try:
+            files = sorted(
+                f for f in os.listdir(SAVE_DIR)
+                if f.startswith("detected_") and f.endswith(".jpg")
+            )
+            if len(files) < 2:
+                print("Not enough images to stitch (need at least 2).")
+                return None
+
+            first_img_path = os.path.join(SAVE_DIR, files[0])
+            latest_img_path = os.path.join(SAVE_DIR, files[-1])
+
+            print(f"Stitching {first_img_path} and {latest_img_path}")
+            img_first = cv2.imread(first_img_path)
+            img_latest = cv2.imread(latest_img_path)
+            if img_first is None or img_latest is None:
+                print("Failed to read one or both images for stitching.")
+                return None
+
+            h1, w1, _ = img_first.shape
+            h2, w2, _ = img_latest.shape
+            if h1 != h2:
+                ratio = h1 / float(h2)
+                new_width = int(w2 * ratio)
+                img_latest = cv2.resize(img_latest, (new_width, h1))
+
+            stitched = np.hstack((img_first, img_latest))
+
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            stitched_path = os.path.join(STITCH_DIR, f"stitched_{timestamp}.jpg")
+            cv2.imwrite(stitched_path, stitched)
+            print(f"Stitched image saved at {stitched_path}")
+            return stitched_path
+
+        except Exception as e:
+            print(f"Error stitching images: {e}")
+            return None
+
+    def perform_detection(self):
+        """Captures an image with libcamera-still and runs YOLO."""
+        detection_start_time = time.time()
+        highest_conf = 0
+
+        try:
+            temp_file = os.path.join(self.temp_dir, f'frame_{time.time()}.jpg')
+            result = subprocess.run([
+                'libcamera-still',
+                '-n',
+                '--width', str(RESOLUTION[0]),
+                '--height', str(RESOLUTION[1]),
+                '-o', temp_file,
+                '--timeout', '50',
+                '--immediate',
+            ], capture_output=True, text=True, check=False)
+
+            if result.returncode != 0:
+                print(f"Camera capture failed: {result.stderr}")
+                return None
+
+            if os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
+                frame = cv2.imread(temp_file)
+                if frame is None:
+                    print("Failed to read captured frame")
+                    return None
+
+                frame_resized = cv2.resize(frame, (640, 640))
+                rgb_frame = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+                results = self.model(rgb_frame, conf=CONFIDENCE)
+
+                if len(results) > 0:
+                    r = results[0]
+                    best_detection = None
+                    if len(r.boxes) > 0:
+                        for box in r.boxes:
+                            cls_id = int(box.cls[0])
+                            conf_val = float(box.conf[0])
+                            if conf_val > highest_conf and conf_val > CONFIDENCE:
+                                highest_conf = conf_val
+                                best_detection = (cls_id, conf_val)
+
+                    if best_detection:
+                        cls_id, conf_val = best_detection
+                        class_name = r.names[cls_id].lower()
+
+                        # skip bullseye if it exists
+                        if class_name == "bullseye":
+                            print("Detected bullseye, ignoring.")
+                            if os.path.exists(temp_file):
+                                os.remove(temp_file)
+                            return None
+
+                        mapped_id = CLASS_MAPPING.get(class_name, 0)
+                        print(f"Detection successful: {class_name} (conf {conf_val:.2f})")
+
+                        annotated = r.plot()
+                        timestamp = time.strftime("%Y%m%d_%H%M%S")
+                        save_path = os.path.join(SAVE_DIR, f"detected_{timestamp}.jpg")
+                        cv2.imwrite(save_path, cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
+                        print(f"Saved detection image to {save_path}")
+
+                        return {
+                            "success": True,
+                            "class_name": class_name,
+                            "class_id": mapped_id,
+                            "confidence": float(conf_val),
+                            "elapsed_time": time.time() - detection_start_time
+                        }
+
+            # Clean up
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+        except Exception as e:
+            print(f"Detection error: {e}")
+            if 'temp_file' in locals() and os.path.exists(temp_file):
+                os.remove(temp_file)
+
+        return None
+
+    def handle_client(self):
+        """
+        Single-thread approach: read commands, do detection or stitching,
+        send result, until client disconnects or error.
+        """
+        while self.running and self.client_socket:
+            try:
+                self.client_socket.settimeout(0.1)
+                command_data = None
+                try:
+                    data = self.client_socket.recv(1024)
+                    if data:
+                        command_data = data.decode('utf-8').strip()
+                except socket.timeout:
+                    pass
+                except Exception as e:
+                    print(f"Error receiving command: {e}")
+                    break
+
+                if command_data:
+                    print(f"Received command: {command_data}")
+                    if command_data.upper() == "STITCH":
+                        # Perform stitching
+                        stitched_path = self.stitch_first_and_latest()
+                        if stitched_path:
+                            response_data = {
+                                "status": "success",
+                                "message": f"Stitched image created: {stitched_path}"
+                            }
+                        else:
+                            response_data = {
+                                "status": "failure",
+                                "message": "Could not stitch images (need at least 2)."
+                            }
+                        try:
+                            msg = json.dumps(response_data).encode('utf-8')
+                            self.client_socket.sendall(msg)
+                            print(f"Sent STITCH response: {msg}")
+                        except (BrokenPipeError, ConnectionResetError) as e:
+                            print(f"Failed to send STITCH response: {e}")
+                            break
+                        continue
+                    elif command_data.startswith("P__"):
+                        # The integration script uses "P__{obstacle_id}" to request detection
+                        # We can either parse the ID or just do detection
+                        # For now, we ignore the ID, do detection
+                        pass
+                    else:
+                        print("Unknown command. Doing normal detection anyway.")
+
+                # Normal detection
+                result = self.perform_detection()
+                if result:
+                    # Only forward left/right
+                    if result["class_name"] in ["left", "right"]:
+                        out_data = {
+                            "class_id": str(result["class_id"]),
+                            "class_name": result["class_name"],
+                            "confidence": result["confidence"]
+                        }
+                        try:
+                            msg = json.dumps(out_data).encode('utf-8')
+                            self.client_socket.sendall(msg)
+                            print(f"Sent detection to integration: {msg}")
+                        except (BrokenPipeError, ConnectionResetError) as e:
+                            print(f"Failed to send detection result: {e}")
+                            break
+                    else:
+                        print(f"Detected {result['class_name']} but ignoring (only left/right).")
+
+                time.sleep(DETECTION_INTERVAL)
+
+            except Exception as e:
+                print(f"Error in handle_client: {e}")
+                break
+
+        # If we exit the loop, close the client
+        if self.client_socket:
+            try:
+                self.client_socket.close()
+            except:
+                pass
+            self.client_socket = None
+            print("Client connection closed")
+
+    def start(self):
+        """Main server loop: wait for connections, handle them one at a time."""
+        self._cleanup_camera()
+        if not self.setup_server():
+            return
+
+        self.running = True
+        print("Detection server started. Waiting for connections...")
+
+        try:
+            while self.running:
+                if self.accept_connection():
+                    self.handle_client()
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("Server stopping...")
+        finally:
+            self.running = False
+            if self.server_socket:
+                self.server_socket.close()
+            if self.client_socket:
+                self.client_socket.close()
+            print("Server stopped.")
+
+    def __del__(self):
+        """Cleanup any leftover resources on object destruction."""
+        if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
+            for f in os.listdir(self.temp_dir):
+                try:
+                    os.remove(os.path.join(self.temp_dir, f))
+                except:
+                    pass
+        if hasattr(self, 'client_socket') and self.client_socket:
+            self.client_socket.close()
+        if hasattr(self, 'server_socket') and self.server_socket:
+            self.server_socket.close()
+
+if __name__ == "__main__":
+    print("Starting Image Detection Server (Task 2 Model)")
+    server = DetectionServer(host="0.0.0.0")
+    server.start()

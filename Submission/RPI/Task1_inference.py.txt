@@ -1,0 +1,441 @@
+import cv2
+import time
+import os
+import threading
+import queue
+import subprocess
+import socket
+import json
+from ultralytics import YOLO
+import numpy as np
+import re
+import glob
+from PIL import Image
+
+# =============================================
+# Configuration Section (Edit These Values)
+# =============================================
+MODEL_PATH = "/home/MDP35/Desktop/Image-Rec/best_task1.pt"
+SAVE_DIR = "/home/MDP35/Desktop/Image-Rec/Results"
+RAW_IMAGE_DIR = os.path.join(SAVE_DIR, 'raw_images')
+ANNOTATED_IMAGE_DIR = os.path.join(SAVE_DIR, 'annotated_images')
+RESOLUTION = (1500, 1200)
+CONFIDENCE = 0.4
+MAX_QUEUE_SIZE = 10  # Maximum images waiting for inference
+DETECTION_SERVER_PORT = 5050
+CALLBACK_HOST = "localhost"
+CALLBACK_PORT = 5051
+
+# Add class mapping dictionary
+CLASS_MAPPING = {
+    'one': 11, 'two': 12, 'three': 13, 'four': 14, 'five': 15,
+    'six': 16, 'seven': 17, 'eight': 18, 'nine': 19,
+    'A': 20, 'B': 21, 'C': 22, 'D': 23, 'E': 24, 'F': 25, 'G': 26,
+    'H': 27, 'S': 28, 'T': 29, 'U': 30, 'V': 31, 'W': 32, 'X': 33,
+    'Y': 34, 'Z': 35, 'up': 36, 'down': 37, 'right': 38, 'left': 39,
+    'circle': 40, 'Bullseye': 41
+}
+
+# =============================================
+# Image Detection Server Class
+# =============================================
+class DetectionServer:
+    def __init__(self, host="localhost", port=DETECTION_SERVER_PORT):
+        self.host = host
+        self.port = port
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.running = False
+        self.model = None
+        self.saved_image_paths = []
+        
+        # Create image processing queue
+        self.image_queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
+        
+        # Create directories
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        os.makedirs(RAW_IMAGE_DIR, exist_ok=True)
+        os.makedirs(ANNOTATED_IMAGE_DIR, exist_ok=True)
+        self.temp_dir = os.path.join(SAVE_DIR, 'temp')
+        os.makedirs(self.temp_dir, exist_ok=True)
+        
+        # Preload model at initialization for faster detection
+        print("Preloading YOLO model...")
+        self.model = YOLO(MODEL_PATH)
+        print("Model loaded successfully.")
+        
+        # Warm up the model with a dummy image to make first detection faster
+        print("Warming up model with dummy inference...")
+        dummy_img = np.zeros((RESOLUTION[1], RESOLUTION[0], 3), dtype=np.uint8)
+        self.model(dummy_img)
+        print("Model warmup complete")
+        
+        # Create thread for processing images from queue
+        self.inference_thread = None
+    
+    def _cleanup_camera(self):
+        """Force cleanup of camera resources"""
+        try:
+            subprocess.run(['sudo', 'pkill', '-f', 'libcamera'], check=False)
+            subprocess.run(['sudo', 'pkill', '-f', 'camera'], check=False)
+            subprocess.run(['sudo', 'modprobe', '-r', 'bcm2835-v4l2'], check=False)
+            time.sleep(1)
+            subprocess.run(['sudo', 'modprobe', 'bcm2835-v4l2'], check=False)
+            time.sleep(2)
+        except Exception as e:
+            print(f"Warning: Camera cleanup error: {str(e)}")
+    
+    def capture_image(self, obstacle_id):
+        """Capture image and add to processing queue"""
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        raw_file_path = os.path.join(RAW_IMAGE_DIR, f"raw_{obstacle_id}_{timestamp}.jpg")
+        
+        try:
+            # Capture the image with libcamera
+            result = subprocess.run([
+                'libcamera-jpeg',
+                '-n',  # no preview
+                '--width', str(RESOLUTION[0]),
+                '--height', str(RESOLUTION[1]),
+                '-o', raw_file_path,
+                '--timeout', '100',  # 100ms timeout
+                '--immediate',
+            ], capture_output=True, text=True, check=False)
+            
+            if result.returncode != 0:
+                print(f"Camera capture failed: {result.stderr}")
+                return {"success": False, "error": "Camera capture failed"}
+            
+            print(f"Image captured and saved to {raw_file_path}")
+            
+            # Add to processing queue
+            queue_item = {
+                "obstacle_id": obstacle_id,
+                "raw_path": raw_file_path,
+                "timestamp": timestamp
+            }
+            
+            # Use non-blocking put with timeout to avoid hanging
+            try:
+                self.image_queue.put(queue_item, block=True, timeout=1)
+                print(f"Image added to processing queue (size: {self.image_queue.qsize()})")
+                return {"success": True, "status": "queued", "queue_size": self.image_queue.qsize()}
+            except queue.Full:
+                print("Processing queue is full. Image cannot be queued.")
+                return {"success": False, "error": "Processing queue is full"}
+                
+        except Exception as e:
+            print(f"Error capturing image: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def inference_worker(self):
+        """Thread that processes images from the queue"""
+        print("Inference worker thread started")
+        
+        while self.running:
+            try:
+                # Get item from queue with timeout to allow checking running status
+                try:
+                    item = self.image_queue.get(block=True, timeout=1)
+                except queue.Empty:
+                    continue
+                
+                # Process the image
+                obstacle_id = item["obstacle_id"]
+                raw_path = item["raw_path"]
+                timestamp = item["timestamp"]
+                
+                print(f"Processing image for obstacle {obstacle_id} from queue")
+                
+                # Perform inference
+                self.process_image(raw_path, obstacle_id, timestamp)
+                
+                # Mark task as done
+                self.image_queue.task_done()
+                    
+            except Exception as e:
+                print(f"Error in inference worker: {e}")
+        
+        print("Inference worker thread stopped")
+    
+    def process_image(self, image_path, obstacle_id, timestamp):
+        """Process a single image from file"""
+        inference_start_time = time.time()
+        
+        try:
+            # Load the image
+            frame = cv2.imread(image_path)
+            if frame is None:
+                print(f"Failed to read image from {image_path}")
+                return False
+            
+            # Convert to RGB for YOLO
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+            # Run detection
+            results = self.model(rgb_frame, conf=CONFIDENCE)
+            
+            # Process results
+            if len(results) > 0:
+                r = results[0]  # Get first result
+                best_detection = None
+                highest_conf = 0
+                
+                if len(r.boxes) > 0:
+                    # Find highest confidence detection
+                    for box in r.boxes:
+                        cls = int(box.cls[0])
+                        conf = float(box.conf[0])
+                        if conf > highest_conf and conf > CONFIDENCE:
+                            highest_conf = conf
+                            best_detection = (cls, conf)
+                
+                if best_detection:
+                    cls, conf = best_detection
+                    class_name = r.names[cls]
+                    
+                    # Get the class ID/code from mapping
+                    class_id = CLASS_MAPPING.get(class_name, 0)
+                    
+                    # Save the annotated image (only on success)
+                    annotated_frame = r.plot()
+                    
+                    # Add additional text with class ID/code
+                    for box in r.boxes:
+                        # Get box coordinates from YOLO results
+                        x1, y1, x2, y2 = box.xyxy[0]
+                        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                        
+                        # Position the text below the default label
+                        text_pos_x = x1
+                        text_pos_y = y1 - 30  # Position above the default label
+                        
+                        # Add both class ID and obstacle ID to text
+                        label = f"{class_name} (ID: {class_id}, Obstacle: {obstacle_id})"
+                        cv2.putText(
+                            annotated_frame,
+                            label,
+                            (text_pos_x, text_pos_y),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8,  # Font scale
+                            (255, 255, 255),  # White text
+                            2,  # Line thickness
+                            cv2.LINE_AA
+                        )
+                    
+                    # Save the annotated frame                            
+                    save_path = os.path.join(ANNOTATED_IMAGE_DIR, f"detected_{obstacle_id}_{timestamp}.jpg")
+                    cv2.imwrite(save_path, cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR))
+                    self.saved_image_paths.append(save_path)
+                    
+                    print(f"Detection successful: {class_name} with confidence {conf:.2f}")
+                    elapsed = time.time() - inference_start_time
+                    print(f"Inference took {elapsed:.3f} seconds")
+                    
+                    self.send_detection_callback(obstacle_id, class_name, class_id, conf)
+
+                    # Return success
+                    return True
+                
+                else:
+                    # If we have a frame but detection failed
+                    # Add text indicating this was a failed detection
+                    cv2.putText(
+                        frame,
+                        f"NO DETECTION (Obstacle: {obstacle_id})",
+                        (30, 50),  # Position at top left
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.2,  # Font scale - larger for visibility
+                        (0, 0, 255),  # Red color
+                        3,  # Line thickness
+                        cv2.LINE_AA
+                    )
+                    
+                    # Save the failed detection image
+                    failed_path = os.path.join(ANNOTATED_IMAGE_DIR, f"failed_{obstacle_id}_{timestamp}.jpg")
+                    cv2.imwrite(failed_path, frame)
+                    self.saved_image_paths.append(failed_path)
+                    print(f"Saved failed detection image to {failed_path}")
+            
+            else:
+                print("No results from model")
+                
+            return False
+                
+        except Exception as e:
+            print(f"Image processing error: {e}")
+            return False
+    
+    def send_detection_callback(self, obstacle_id, class_name, class_id, confidence):
+        """Send detection results back to FinalIntegration"""
+        try:
+            callback_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            callback_socket.connect((CALLBACK_HOST, CALLBACK_PORT))
+            
+            result = {
+                "obstacle_id": obstacle_id,
+                "class_name": class_name,
+                "class_id": class_id,
+                "confidence": float(confidence)
+            }
+            
+            callback_socket.sendall(json.dumps(result).encode())
+            callback_socket.close()
+            print(f"Detection callback sent: {result}")
+        except Exception as e:
+            print(f"Failed to send detection callback: {e}")
+        
+    def handle_client(self, client_socket):
+        """Handle client connection and detection requests"""
+        try:
+            while self.running:
+                data = client_socket.recv(1024)
+                if not data:
+                    break
+                
+                try:
+                    # Try to parse the message
+                    message = data.decode('utf-8').strip()
+                    print(f"Received request: {message}")
+                    
+                    # Pattern matching for P__XX commands
+                    match = re.match(r'P__(\d{1,2})', message)
+                    if match:
+                        obstacle_id = match.group(1)
+                        # Always use padded IDs internally for consistency
+                        padded_id = obstacle_id.zfill(2)
+                        print(f"Processing detection for obstacle {padded_id}")
+                        
+                        # Just capture the image and queue it
+                        result = self.capture_image(padded_id)
+                        
+                        # Send back the result as JSON
+                        client_socket.sendall(json.dumps(result).encode('utf-8'))
+                    else:
+                        # Unknown command
+                        print(f"Invalid command format: {message}")
+                        client_socket.sendall(json.dumps({
+                            "success": False, 
+                            "error": f"Invalid command format: {message}"
+                        }).encode('utf-8'))
+                        
+                except Exception as e:
+                    print(f"Error processing request: {e}")
+                    client_socket.sendall(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+                    
+        except Exception as e:
+            print(f"Client connection error: {e}")
+        finally:
+            client_socket.close()
+    
+    def create_merged_image(self, prefix=None):
+        """Merge all saved detection images into a single composite image"""
+        if not self.saved_image_paths:
+            print("No images to merge")
+            return False
+            
+        try:
+            print(f"Creating merged image from {len(self.saved_image_paths)} detection results")
+            
+            # Force reimport PIL to avoid namespace issues
+            from PIL import Image as PILImage
+            
+            # Load all images using PIL
+            images = [PILImage.open(img_path) for img_path in self.saved_image_paths]
+            
+            # Calculate grid size - aim for roughly square layout
+            import math
+            grid_size = math.ceil(math.sqrt(len(images)))
+            
+            # Calculate merged image size
+            sample_img = images[0]
+            img_width, img_height = sample_img.size
+            merged_width = img_width * min(grid_size, len(images))
+            merged_height = img_height * ((len(images) + grid_size - 1) // grid_size)
+            
+            # Create a blank canvas for the merged image
+            merged_image = PILImage.new('RGB', (merged_width, merged_height), (0, 0, 0))
+            
+            # Paste images onto the canvas
+            for idx, img in enumerate(images):
+                x = (idx % grid_size) * img_width
+                y = (idx // grid_size) * img_height
+                merged_image.paste(img, (x, y))
+            
+            # Save the merged image
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            filename = f"{prefix or 'merged_detections'}_{timestamp}.jpg"
+            merged_path = os.path.join(SAVE_DIR, filename)
+            merged_image.save(merged_path)
+            print(f"Merged image saved to {merged_path}")
+            return merged_path
+            
+        except Exception as e:
+            print(f"Error creating merged image: {e}")
+            return False
+    
+    def start(self):
+        """Start the detection server with separate inference thread"""
+        # Clean up camera before starting
+        self._cleanup_camera()
+        
+        # Start the inference thread
+        self.running = True
+        self.inference_thread = threading.Thread(target=self.inference_worker)
+        self.inference_thread.daemon = True
+        self.inference_thread.start()
+        
+        # Bind and listen
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(5)
+        
+        print(f"Detection server started on {self.host}:{self.port}")
+        print(f"Raw images will be saved to: {RAW_IMAGE_DIR}")
+        print(f"Annotated images will be saved to: {ANNOTATED_IMAGE_DIR}")
+        print("Waiting for connection from integration script...")
+        
+        try:
+            while self.running:
+                client_socket, addr = self.server_socket.accept()
+                print(f"Connected to client: {addr}")
+                client_thread = threading.Thread(target=self.handle_client, args=(client_socket,))
+                client_thread.daemon = True
+                client_thread.start()
+        except KeyboardInterrupt:
+            print("Server stopping...")
+            self.running = False
+            self.create_merged_image()
+        finally:
+            self.running = False
+            
+            # Wait for inference thread to finish processing
+            if self.inference_thread and self.inference_thread.is_alive():
+                print("Waiting for inference thread to complete...")
+                self.inference_thread.join(timeout=5)
+            
+            # Create merged image one final time
+            self.create_merged_image()
+            
+            self.server_socket.close()
+            print("Server stopped.")
+    
+    def __del__(self):
+        # Create merged image before cleanup
+        if hasattr(self, 'running'):
+            self.running = False
+        
+        if hasattr(self, 'saved_image_paths') and self.saved_image_paths:
+            self.create_merged_image()
+            
+        # Clean up temp directory
+        if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
+            for file in os.listdir(self.temp_dir):
+                try:
+                    os.remove(os.path.join(self.temp_dir, file))
+                except:
+                    pass
+
+if __name__ == "__main__":
+    print("Starting Image Detection Server with Separated Capture/Inference")
+    server = DetectionServer(host="0.0.0.0")  # Listen on all interfaces
+    server.start()
