@@ -6,6 +6,12 @@ By: Group 35, AY24-25 Semester 2
 
 ---
 
+![Rover](pictures/)
+![Controller](pictures/)
+![Task](pictures/)
+
+---
+
 # Key Features
 
 - **Raspberry Pi Edge AI**: Low-latency, multi-threaded inference system in Python & C++.
