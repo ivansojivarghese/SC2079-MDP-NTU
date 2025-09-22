@@ -7,7 +7,6 @@ By: Group 35, AY24-25 Semester 2
 ---
 
 ![Rover](pictures/rover.jpeg)
-![Controller](pictures/controller.jpeg)
 ![Task](pictures/task.jpeg)
 
 ---
