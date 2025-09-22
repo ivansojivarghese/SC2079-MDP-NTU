@@ -1,4 +1,4 @@
-# SC2079-MDP-Grp35
+# SC2079-MDP-Grp35-AY24/25-Sem2
 
 # Simulation
 In order to run simulation, navigate to project directory.
